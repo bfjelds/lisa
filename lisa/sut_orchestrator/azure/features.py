@@ -40,7 +40,7 @@ from lisa import Logger, features, schema, search_space
 from lisa.feature import Feature
 from lisa.features.gpu import ComputeSDK
 from lisa.features.resize import ResizeAction
-from lisa.features.security_profile import SecurityProfileSettings, SecurityProfileType
+from lisa.features.security_profile import SecurityProfileType
 from lisa.node import Node, RemoteNode
 from lisa.operating_system import CentOs, Redhat, Suse, Ubuntu
 from lisa.search_space import RequirementMethod
@@ -914,6 +914,12 @@ class AzureDiskOptionSettings(schema.DiskOptionSettings):
             ),
             "max_data_disk_count",
         )
+        result.merge(
+            search_space.check_setspace(
+                self.disk_controller_type, capability.disk_controller_type
+            ),
+            "disk_controller_type",
+        )
 
         return result
 
@@ -925,6 +931,9 @@ class AzureDiskOptionSettings(schema.DiskOptionSettings):
         assert (
             capability.disk_type
         ), "capability should have at least one disk type, but it's None"
+        assert (
+            capability.disk_controller_type
+        ), "capability should have at least one disk controller type, but it's None"
         value = AzureDiskOptionSettings()
         super_value = schema.DiskOptionSettings._call_requirement_method(
             self, method_name, capability
@@ -947,6 +956,30 @@ class AzureDiskOptionSettings(schema.DiskOptionSettings):
 
         value.disk_type = getattr(search_space, f"{method_name}_setspace_by_priority")(
             self.disk_type, capability.disk_type, schema.disk_type_priority
+        )
+
+        cap_disk_controller_type = capability.disk_controller_type
+        if isinstance(cap_disk_controller_type, search_space.SetSpace):
+            assert len(cap_disk_controller_type) > 0, (
+                "capability should have at least one "
+                "disk controller type, but it's empty"
+            )
+        elif isinstance(cap_disk_controller_type, schema.DiskControllerType):
+            cap_disk_controller_type = search_space.SetSpace[schema.DiskControllerType](
+                is_allow_set=True, items=[cap_disk_controller_type]
+            )
+        else:
+            raise LisaException(
+                "unknown disk controller type "
+                f"on capability, type: {cap_disk_controller_type}"
+            )
+
+        value.disk_controller_type = getattr(
+            search_space, f"{method_name}_setspace_by_priority"
+        )(
+            self.disk_controller_type,
+            capability.disk_controller_type,
+            schema.disk_controller_type_priority,
         )
 
         # below values affect data disk only.
@@ -1518,6 +1551,41 @@ class Hibernation(AzureFeatureMixin, features.Hibernation):
         virtual_machines["properties"].update(json.loads(cls._hibernation_properties))
 
 
+@dataclass_json()
+@dataclass()
+class SecurityProfileSettings(features.SecurityProfileSettings):
+    disk_encryption_set_id: str = field(
+        default="",
+        metadata=field_metadata(
+            required=False,
+        ),
+    )
+
+    def __hash__(self) -> int:
+        return hash(self._get_key())
+
+    def _get_key(self) -> str:
+        return (
+            f"{self.type}/{self.security_profile}/"
+            f"{self.encrypt_disk}/{self.disk_encryption_set_id}"
+        )
+
+    def _call_requirement_method(self, method_name: str, capability: Any) -> Any:
+        super_value: SecurityProfileSettings = super()._call_requirement_method(
+            method_name, capability
+        )
+        value = SecurityProfileSettings()
+        value.security_profile = super_value.security_profile
+        value.encrypt_disk = super_value.encrypt_disk
+
+        if self.disk_encryption_set_id:
+            value.disk_encryption_set_id = self.disk_encryption_set_id
+        else:
+            value.disk_encryption_set_id = capability.disk_encryption_set_id
+
+        return value
+
+
 class SecurityProfile(AzureFeatureMixin, features.SecurityProfile):
     _both_enabled_properties = """
         {
@@ -1534,6 +1602,10 @@ class SecurityProfile(AzureFeatureMixin, features.SecurityProfile):
     def _initialize(self, *args: Any, **kwargs: Any) -> None:
         super()._initialize(*args, **kwargs)
         self._initialize_information(self._node)
+
+    @classmethod
+    def settings_type(cls) -> Type[schema.FeatureSettings]:
+        return SecurityProfileSettings
 
     @classmethod
     def create_setting(
@@ -1604,13 +1676,24 @@ class SecurityProfile(AzureFeatureMixin, features.SecurityProfile):
                 "DiskWithVMGuestState" if settings.encrypt_disk else "VMGuestStateOnly"
             )
 
+            if settings.disk_encryption_set_id:
+                disk_encryption_set = (
+                    ',"diskEncryptionSet":{"id":"'
+                    f"{settings.disk_encryption_set_id}"
+                    '"}'
+                )
+            else:
+                disk_encryption_set = ""
+
             template["functions"][0]["members"]["getOSImage"]["output"]["value"][
                 "managedDisk"
             ] = (
-                "[if(not(equals(parameters('node')['disk_type'], "
-                "'Ephemeral')), json(concat('{\"storageAccountType\": \"',parameters"
-                "('node')['disk_type'],'\",\"securityProfile\":{"
-                f'"securityEncryptionType": "{security_encryption_type}"'
+                "[if(not(equals(parameters('node')['disk_type'], 'Ephemeral')), "
+                'json(concat(\'{"storageAccountType": "\','
+                "parameters('node')['disk_type'],"
+                '\'","securityProfile":{"securityEncryptionType": "'
+                f'{security_encryption_type}"'
+                f"{disk_encryption_set}"
                 "}}')), json('null'))]"
             )
         else:

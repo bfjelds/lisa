@@ -76,6 +76,8 @@ from .. import AZURE
 from . import features
 from .common import (
     AZURE_SHARED_RG_NAME,
+    AZURE_SUBNET_PREFIX,
+    AZURE_VIRTUAL_NETWORK_NAME,
     AzureArmParameter,
     AzureNodeArmParameter,
     AzureNodeSchema,
@@ -256,6 +258,10 @@ class AzurePlatformSchema:
     vm_tags: Optional[Dict[str, Any]] = field(default=None)
     locations: Optional[Union[str, List[str]]] = field(default=None)
 
+    virtual_network_resource_group: str = field(default="")
+    virtual_network_name: str = field(default=AZURE_VIRTUAL_NETWORK_NAME)
+    subnet_prefix: str = field(default=AZURE_SUBNET_PREFIX)
+
     # Provisioning error causes by waagent is not ready or other reasons. In
     # smoke test, it can verify some points also. Other tests should use the
     # default False to raise errors to prevent unexpected behavior.
@@ -296,6 +302,9 @@ class AzurePlatformSchema:
                 "resource_group_name",
                 "locations",
                 "log_level",
+                "virtual_network_resource_group",
+                "virtual_network_name",
+                "subnet_prefix",
             ],
         )
 
@@ -467,6 +476,7 @@ class AzurePlatform(Platform):
             environment_context.resource_group_is_specified = True
 
         environment_context.resource_group_name = resource_group_name
+
         if self._azure_runbook.dry_run:
             log.info(f"dry_run: {self._azure_runbook.dry_run}")
         else:
@@ -968,6 +978,12 @@ class AzurePlatform(Platform):
         ]
         set_filtered_fields(self._azure_runbook, arm_parameters, copied_fields)
 
+        arm_parameters.virtual_network_resource_group = (
+            self._azure_runbook.virtual_network_resource_group
+        )
+        arm_parameters.subnet_prefix = self._azure_runbook.subnet_prefix
+        arm_parameters.virtual_network_name = self._azure_runbook.virtual_network_name
+
         is_windows: bool = False
         arm_parameters.admin_username = self.runbook.admin_username
         if self.runbook.admin_private_key_file:
@@ -1256,7 +1272,7 @@ class AzurePlatform(Platform):
             )
             arm_parameters.osdisk_size_in_gb = max(
                 arm_parameters.osdisk_size_in_gb,
-                image_info.os_disk_image.additional_properties["sizeInGb"],
+                image_info.os_disk_image.additional_properties.get("sizeInGb", 0),
             )
             if not arm_parameters.purchase_plan and image_info.plan:
                 # expand values for lru cache
@@ -1277,6 +1293,14 @@ class AzurePlatform(Platform):
         arm_parameters.disk_type = features.get_azure_disk_type(
             capability.disk.disk_type
         )
+        assert isinstance(
+            capability.disk.disk_controller_type, schema.DiskControllerType
+        )
+        assert (
+            arm_parameters.hyperv_generation == 2
+            or capability.disk.disk_controller_type == schema.DiskControllerType.SCSI
+        ), "Gen 1 images cannot be set to NVMe Disk Controller Type"
+        arm_parameters.disk_controller_type = capability.disk.disk_controller_type.value
 
         assert capability.network_interface
         assert isinstance(
@@ -1498,6 +1522,9 @@ class AzurePlatform(Platform):
         node_space.disk.disk_type = search_space.SetSpace[schema.DiskType](
             is_allow_set=True, items=[]
         )
+        node_space.disk.disk_controller_type = search_space.SetSpace[
+            schema.DiskControllerType
+        ](is_allow_set=True, items=[])
         node_space.disk.data_disk_iops = search_space.IntRange(min=0)
         node_space.disk.data_disk_size = search_space.IntRange(min=0)
         node_space.network_interface = schema.NetworkInterfaceOptionSettings()
@@ -1544,6 +1571,21 @@ class AzurePlatform(Platform):
 
         if azure_raw_capabilities.get("PremiumIO", None) == "True":
             node_space.disk.disk_type.add(schema.DiskType.PremiumSSDLRS)
+
+        disk_controller_types = azure_raw_capabilities.get("DiskControllerTypes", None)
+        if disk_controller_types:
+            for allowed_type in disk_controller_types.split(","):
+                try:
+                    node_space.disk.disk_controller_type.add(
+                        schema.DiskControllerType(allowed_type)
+                    )
+                except ValueError:
+                    self._log.error(
+                        f"'{allowed_type}' is not a known Disk Controller Type "
+                        f"({[x for x in schema.DiskControllerType]})"
+                    )
+        else:
+            node_space.disk.disk_controller_type.add(schema.DiskControllerType.SCSI)
 
         if azure_raw_capabilities.get("EphemeralOSDiskSupported", None) == "True":
             # Check if CachedDiskBytes is greater than 30GB
@@ -1773,6 +1815,11 @@ class AzurePlatform(Platform):
         node_space.disk.disk_type.add(schema.DiskType.Ephemeral)
         node_space.disk.disk_type.add(schema.DiskType.StandardHDDLRS)
         node_space.disk.disk_type.add(schema.DiskType.StandardSSDLRS)
+        node_space.disk.disk_controller_type = search_space.SetSpace[
+            schema.DiskControllerType
+        ](is_allow_set=True, items=[])
+        node_space.disk.disk_controller_type.add(schema.DiskControllerType.SCSI)
+        node_space.disk.disk_controller_type.add(schema.DiskControllerType.NVME)
         node_space.network_interface = schema.NetworkInterfaceOptionSettings()
         node_space.network_interface.data_path = search_space.SetSpace[
             schema.NetworkDataPath
@@ -2021,13 +2068,21 @@ class AzurePlatform(Platform):
         container_name = matched.group("container")
         blob_name = matched.group("blob")
         storage_client = get_storage_client(self.credential, self.subscription_id)
-        sc = [x for x in storage_client.storage_accounts.list() if x.name == sc_name]
+        # sometimes it will fail for below reason if list storage accounts like this way
+        # [x for x in storage_client.storage_accounts.list() if x.name == sc_name]
+        # failure - Message: Resource provider 'Microsoft.Storage' failed to return collection response for type 'storageAccounts'.  # noqa: E501
+        sc_list = storage_client.storage_accounts.list()
+        found_sc = None
+        for sc in sc_list:
+            if sc.name == sc_name:
+                found_sc = sc
+                break
         assert (
-            sc
+            found_sc
         ), f"storage account {sc_name} not found in subscription {self.subscription_id}"
-        rg = get_matched_str(sc[0].id, RESOURCE_GROUP_PATTERN)
+        rg = get_matched_str(found_sc.id, RESOURCE_GROUP_PATTERN)
         return {
-            "location": sc[0].location,
+            "location": found_sc.location,
             "resource_group_name": rg,
             "account_name": sc_name,
             "container_name": container_name,
